@@ -1,0 +1,16 @@
+{
+  "name": "vino-permit-ai",
+  "version": "0.1.0",
+  "description": "Minimal static server for Vino Permit AI dashboard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "echo \"No tests configured\" && exit 0"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

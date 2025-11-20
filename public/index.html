@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vino Permit AI - Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fb; }
+        .dashboard-card { transition: all 0.3s ease; }
+        .dashboard-card:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(0,0,0,0.05); }
+        .upload-area { border: 2px dashed #93c5fd; }
+        .upload-area.drag-over { border-color: #3b82f6; background-color: #eff6ff; }
+        /* Custom scrollbar for table */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        /* Modal specific styling */
+        .modal-overlay {
+            background-color: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(4px);
+        }
+    </style>
+</head>
+<body class="min-h-screen p-4 sm:p-8">
+
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        // NOTE: Added getDoc to the imports for fetching project details
+        import { getFirestore, collection, onSnapshot, query, orderBy, setDoc, doc, serverTimestamp, setLogLevel, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global Firebase variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth, userId = null;
+        let isAuthReady = false;
+
+        // Utility function for exponential backoff (required for API calls, but good practice here)
+        async function fetchWithRetry(fn, maxRetries = 5, delay = 1000) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    return await fn();
+                } catch (error) {
+                    if (i === maxRetries - 1) throw error;
+                    console.warn(`Attempt ${i + 1} failed. Retrying in ${delay / 1000}s...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2; // Exponential backoff
+                }
+            }
+        }
+
+        /**
+         * Initializes Firebase and authenticates the user.
+         */
+        async function initializeFirebase() {
+            if (!firebaseConfig) {
+                console.error("Firebase config is missing. Cannot initialize Firebase.");
+                document.getElementById('app-container').innerHTML = `<p class="text-red-600 font-bold">Error: Firebase Configuration Missing.</p>`;
+                return;
+            }
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('Debug'); // Enable detailed logs
+
+                // 1. Handle Authentication
+                await fetchWithRetry(async () => {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                });
+
+                // 2. Set up Auth State Listener
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                        isAuthReady = true;
+                        // Start listeners and update UI once authenticated
+                        setupProjectListener();
+                    } else {
+                        isAuthReady = true;
+                        console.log("No user signed in. Using anonymous or default session.");
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization or sign-in failed:", error);
+                document.getElementById('app-container').innerHTML = `<p class="text-red-600 font-bold">Authentication Failed: ${error.message}</p>`;
+            }
+        }
+
+        /**
+         * Attaches a real-time listener to the user's projects collection.
+         */
+        function setupProjectListener() {
+            if (!isAuthReady || !userId || !db) return;
+
+            // Define the private collection path
+            const projectsPath = `/artifacts/${appId}/users/${userId}/projects`;
+            const q = query(collection(db, projectsPath), orderBy("uploadDate", "desc"));
+
+            onSnapshot(q, (snapshot) => {
+                const projects = [];
+                snapshot.forEach((doc) => {
+                    projects.push({ id: doc.id, ...doc.data() });
+                });
+                renderProjectList(projects);
+            }, (error) => {
+                console.error("Error fetching projects:", error);
+                // Display error message to user
+                document.getElementById('project-list-tbody').innerHTML = `<tr><td colspan="5" class="p-4 text-center text-red-500">Error loading projects. See console for details.</td></tr>`;
+            });
+        }
+
+        /**
+         * Renders the list of projects in the table.
+         * @param {Array<Object>} projects - List of project objects.
+         */
+        function renderProjectList(projects) {
+            const tbody = document.getElementById('project-list-tbody');
+            tbody.innerHTML = ''; // Clear existing rows
+
+            if (projects.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="5" class="p-4 text-center text-gray-500">No scans found. Upload a PDF plan set above!</td></tr>`;
+                return;
+            }
+
+            projects.forEach(project => {
+                const statusColor = {
+                    'ready_for_upload': 'text-gray-500 bg-gray-100',
+                    'processing': 'text-yellow-600 bg-yellow-100 animate-pulse',
+                    'results_ready': 'text-green-600 bg-green-100',
+                    'error': 'text-red-600 bg-red-100'
+                }[project.status] || 'text-blue-600 bg-blue-100';
+
+                // Changed button action to showProjectDetails
+                const actions = project.status === 'results_ready'
+                    ? `<button onclick="showProjectDetails('${project.id}')" class="text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 px-3 py-1 rounded-full shadow-md transition duration-150">View Report</button>`
+                    : `<span class="text-sm text-gray-500">Wait...</span>`;
+
+                const date = project.uploadDate ? new Date(project.uploadDate.seconds * 1000).toLocaleString() : 'N/A';
+
+                const row = `
+                    <tr class="border-b hover:bg-gray-50">
+                        <td class="p-4 text-sm font-medium text-gray-900">${project.name}</td>
+                        <td class="p-4 text-sm text-gray-500 hidden sm:table-cell">${project.id.substring(0, 8)}...</td>
+                        <td class="p-4 text-sm text-gray-500">${date}</td>
+                        <td class="p-4">
+                            <span class="inline-flex items-center px-3 py-1.5 rounded-full text-xs font-semibold ${statusColor}">
+                                ${project.status.toUpperCase().replace('_', ' ')}
+                            </span>
+                        </td>
+                        <td class="p-4 text-right">${actions}</td>
+                    </tr>
+                `;
+                tbody.insertAdjacentHTML('beforeend', row);
+            });
+        }
+
+        /**
+         * Simulates a PDF upload and starts the AI processing flow.
+         * @param {string} fileName - The name of the uploaded file.
+         */
+        window.handleFileUpload = async (fileName) => {
+            if (!isAuthReady || !userId) {
+                console.warn("Authentication not ready. Cannot upload.");
+                alertMessage("Authentication is still loading. Please wait a moment.", "error");
+                return;
+            }
+
+            const projectRef = doc(collection(db, `/artifacts/${appId}/users/${userId}/projects`));
+
+            const projectData = {
+                name: fileName.replace(/\.pdf$/i, ''),
+                uploadDate: serverTimestamp(),
+                status: 'processing', // Initial status: starts AI pipeline
+                violations: [],
+                originalFilename: fileName,
+                projectId: projectRef.id // Store project ID for reference
+            };
+
+            try {
+                await fetchWithRetry(() => setDoc(projectRef, projectData));
+                alertMessage(`Scan for '${fileName}' initiated. Status: PROCESSING...`, "success");
+
+                // --- SIMULATED AI PROCESSING ---
+                // We simulate the 5-10 second delay and the result being ready.
+                setTimeout(async () => {
+                    const mockViolations = [
+                        { summary: "Non-compliant stair riser height (8.0in > 7.75in max).", code: "CRC 2022, R311.7.5.1", location: "Sheet A2.1, Detail B", fix: "Decrease riser height to 7.75 inches or less and update dimensions." },
+                        { summary: "WUI-compliant vents missing on attic eaves.", code: "CBC 2022, 707.12.3", location: "Elevation A", fix: "Specify protected attic vents meeting WUI requirements." },
+                        { summary: "Side Setback violation (9ft 6in provided, 10ft required).", code: "Napa Zoning 18.16.030", location: "Site Plan", fix: "Shift structure 6 inches to the interior, away from the property line." }
+                    ];
+
+                    await fetchWithRetry(() => updateProjectStatus(projectRef.id, 'results_ready', mockViolations));
+                    alertMessage(`Scan for '${fileName}' completed. Results ready for download!`, "success");
+
+                }, 5000 + Math.random() * 5000); // 5-10 second simulation
+
+            } catch (error) {
+                console.error("Error initiating project scan:", error);
+                alertMessage("Failed to initiate scan. Check console.", "error");
+                await fetchWithRetry(() => updateProjectStatus(projectRef.id, 'error', []));
+            }
+        };
+
+        /**
+         * Utility function to update project status.
+         */
+        async function updateProjectStatus(projectId, status, violations) {
+             if (!isAuthReady || !userId) return;
+             const projectRef = doc(db, `/artifacts/${appId}/users/${userId}/projects/${projectId}`);
+             await setDoc(projectRef, { status: status, violations: violations }, { merge: true });
+        }
+
+        /**
+         * Fetches project details and displays them in a modal.
+         */
+        window.showProjectDetails = async (projectId) => {
+            if (!isAuthReady || !userId || !db) return;
+
+            const projectRef = doc(db, `/artifacts/${appId}/users/${userId}/projects/${projectId}`);
+            try {
+                const projectSnap = await fetchWithRetry(() => getDoc(projectRef));
+
+                if (projectSnap.exists()) {
+                    const project = projectSnap.data();
+                    renderModalContent(project);
+                    document.getElementById('project-details-modal').classList.remove('hidden');
+                } else {
+                    alertMessage("Project details not found.", "error");
+                }
+            } catch (error) {
+                console.error("Error fetching project details:", error);
+                alertMessage("Failed to load project details.", "error");
+            }
+        };
+
+        /**
+         * Closes the project details modal.
+         */
+        window.closeModal = () => {
+            document.getElementById('project-details-modal').classList.add('hidden');
+        };
+
+        /**
+         * Renders the content within the project details modal.
+         * @param {Object} project - The project data object.
+         */
+        function renderModalContent(project) {
+            document.getElementById('modal-project-name').textContent = project.name;
+            document.getElementById('modal-project-status').textContent = project.status.toUpperCase().replace('_', ' ');
+            document.getElementById('modal-project-id').textContent = project.projectId || project.id;
+            
+            // Set up the download button to simulate the final output package generation
+            document.getElementById('modal-download-btn').onclick = () => {
+                alertMessage(`Initiating final package download for ${project.name}: Redlined PDF, Issue Log, and Permit Forms...`, 'info');
+                window.closeModal();
+            };
+
+            const violationsList = document.getElementById('modal-violations-list');
+            violationsList.innerHTML = ''; // Clear previous content
+
+            if (project.violations && project.violations.length > 0) {
+                // Render the detailed Issue Log
+                project.violations.forEach((violation, index) => {
+                    const item = document.createElement('div');
+                    item.className = 'border-b border-gray-200 py-4 last:border-b-0';
+                    item.innerHTML = `
+                        <h4 class="text-lg font-extrabold text-red-700 mb-1">ISSUE ${index + 1}: ${violation.summary}</h4>
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-2 text-sm">
+                            <div>
+                                <p class="font-medium text-gray-700">Code Reference:</p>
+                                <span class="font-mono bg-gray-100 p-1 rounded text-gray-800 text-xs">${violation.code}</span>
+                            </div>
+                            <div>
+                                <p class="font-medium text-gray-700">Location (Blueprint):</p>
+                                <span class="bg-gray-100 p-1 rounded text-gray-800 text-xs">${violation.location}</span>
+                            </div>
+                            <div class="md:col-span-3 mt-1">
+                                <p class="font-medium text-gray-700">Prescribed Fix/Next Step:</p>
+                                <p class="text-indigo-600 font-semibold">${violation.fix}</p>
+                            </div>
+                        </div>
+                    `;
+                    violationsList.appendChild(item);
+                });
+            } else {
+                violationsList.innerHTML = '<p class="text-gray-500 italic p-6 text-center">No high-priority code violations were detected in this run. A full compliance report is still available for download below.</p>';
+            }
+        }
+
+
+        /**
+         * Global message handler (replaces alert()).
+         * @param {string} message - The message text.
+         * @param {string} type - 'success', 'error', or 'info'.
+         */
+        function alertMessage(message, type = 'info') {
+            const colorMap = {
+                success: 'bg-green-500',
+                error: 'bg-red-500',
+                info: 'bg-blue-500'
+            };
+            const container = document.getElementById('message-container');
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `p-4 rounded-lg shadow-xl text-white font-medium ${colorMap[type]} transition-opacity duration-300 mb-2`;
+            alertDiv.textContent = message;
+
+            container.prepend(alertDiv);
+            setTimeout(() => {
+                alertDiv.classList.add('opacity-0');
+                setTimeout(() => alertDiv.remove(), 300);
+            }, 5000);
+        }
+
+        // --- Drag and Drop Handlers ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeFirebase();
+
+            const dropArea = document.getElementById('drop-area');
+
+            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+                dropArea.addEventListener(eventName, preventDefaults, false);
+            });
+
+            function preventDefaults(e) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+
+            ['dragenter', 'dragover'].forEach(eventName => {
+                dropArea.addEventListener(eventName, () => dropArea.classList.add('drag-over'), false);
+            });
+
+            ['dragleave', 'drop'].forEach(eventName => {
+                dropArea.addEventListener(eventName, () => dropArea.classList.remove('drag-over'), false);
+            });
+
+            dropArea.addEventListener('drop', handleDrop, false);
+
+            function handleDrop(e) {
+                const dt = e.dataTransfer;
+                const files = dt.files;
+                if (files.length > 0 && files[0].type === 'application/pdf') {
+                    window.handleFileUpload(files[0].name);
+                } else {
+                    alertMessage("Please drop a single PDF file.", "error");
+                }
+            }
+
+            document.getElementById('file-input').addEventListener('change', (e) => {
+                if (e.target.files.length > 0) {
+                    window.handleFileUpload(e.target.files[0].name);
+                }
+            });
+        });
+
+    </script>
+
+    <!-- Main Application Container -->
+    <div id="app-container" class="max-w-6xl mx-auto">
+
+        <!-- Header -->
+        <header class="mb-8">
+            <h1 class="text-4xl font-extrabold text-gray-800 mb-2">Vino Permit AI</h1>
+            <p class="text-xl text-indigo-600 font-semibold">Internal Design Compliance Accelerator</p>
+            <div id="user-id-display" class="mt-2 text-sm text-gray-500">Loading User ID...</div>
+        </header>
+
+        <!-- Message Container -->
+        <div id="message-container" class="fixed top-4 right-4 z-50 w-full max-w-sm">
+            <!-- Messages will appear here -->
+        </div>
+
+        <!-- 1. PDF Upload Area -->
+        <div class="dashboard-card bg-white p-6 rounded-xl shadow-lg mb-8">
+            <h2 class="text-2xl font-semibold text-gray-700 mb-4">Upload Plan Set (PDF)</h2>
+
+            <div id="drop-area" class="upload-area p-10 rounded-xl text-center cursor-pointer transition duration-200">
+                <input type="file" id="file-input" accept="application/pdf" class="hidden">
+                <svg xmlns="http://www.w3.org/2000/svg" class="mx-auto h-12 w-12 text-blue-400 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 014 4v2a1 1 0 01-1 1h-6a1 1 0 01-1-1v-2a1 1 0 011-1h6a3 3 0 00-3-3h-1.5a.5.5 0 01-.5-.5V8a1 1 0 00-1-1h-2a1 1 0 00-1 1v1.5a.5.5 0 01-.5.5h-1.5a3 3 0 00-3 3v2a1 1 0 01-1 1h-6a1 1 0 01-1-1v-2a1 1 0 011-1h6a3 3 0 00-3-3z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16h4.586a2 2 0 001.414-.586l4.414-4.414a2 2 0 000-2.828l-1.586-1.586a2 2 0 00-2.828 0L7 12a2 2 0 01-1.414.586H4a2 2 0 00-2 2v2a2 2 0 002 2z"/>
+                </svg>
+                <p class="text-gray-600 font-medium">Drag & Drop PDF here, or <label for="file-input" class="text-indigo-600 hover:text-indigo-800 cursor-pointer font-bold">click to browse</label></p>
+                <p class="text-xs text-gray-400 mt-1">Accepts single residential plan set PDF files only.</p>
+            </div>
+        </div>
+
+        <!-- 2. Project List / History Table -->
+        <div class="dashboard-card bg-white p-6 rounded-xl shadow-lg">
+            <h2 class="text-2xl font-semibold text-gray-700 mb-4">Scan History & Project Status</h2>
+
+            <div class="overflow-x-auto rounded-lg border border-gray-200">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th scope="col" class="p-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Project Name</th>
+                            <th scope="col" class="p-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden sm:table-cell">ID</th>
+                            <th scope="col" class="p-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                            <th scope="col" class="p-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                            <th scope="col" class="p-4 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="project-list-tbody" class="bg-white divide-y divide-gray-200">
+                        <!-- Project rows will be rendered here by JavaScript -->
+                        <tr>
+                            <td colspan="5" class="p-4 text-center text-gray-500">Loading project data...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Project Details Modal (Hidden by Default) -->
+    <div id="project-details-modal" class="fixed inset-0 z-50 overflow-y-auto hidden">
+        <!-- Modal Overlay -->
+        <div class="modal-overlay fixed inset-0 transition-opacity" onclick="closeModal()"></div>
+
+        <!-- Modal Content -->
+        <div class="flex items-center justify-center min-h-screen p-4">
+            <div class="bg-white rounded-xl shadow-2xl w-full max-w-3xl transform transition-all">
+                
+                <!-- Modal Header -->
+                <div class="p-6 border-b border-gray-200 flex justify-between items-center">
+                    <div>
+                        <h3 class="text-2xl font-extrabold text-gray-800" id="modal-project-name">Project Report</h3>
+                        <p class="text-sm text-gray-500 mt-1">ID: <span id="modal-project-id">N/A</span> | Status: <span id="modal-project-status" class="font-semibold text-indigo-600">LOADING</span></p>
+                    </div>
+                    <button onclick="closeModal()" class="text-gray-400 hover:text-gray-600 transition">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+
+                <!-- Modal Body (Issue Log) -->
+                <div class="p-6 max-h-[70vh] overflow-y-auto">
+                    <h4 class="text-xl font-bold text-gray-700 mb-4 border-b pb-2">Compliance Issue Log (Simulated)</h4>
+                    <div id="modal-violations-list" class="space-y-4">
+                        <!-- Violations will be rendered here by JavaScript -->
+                        <p class="text-center text-gray-400">Loading report content...</p>
+                    </div>
+                </div>
+
+                <!-- Modal Footer -->
+                <div class="p-6 bg-gray-50 rounded-b-xl border-t border-gray-200 flex justify-end space-x-3">
+                    <button onclick="closeModal()" class="px-4 py-2 bg-gray-200 text-gray-700 font-medium rounded-full hover:bg-gray-300 transition duration-150 shadow-sm">
+                        Close
+                    </button>
+                    <button id="modal-download-btn" class="px-6 py-2 bg-green-600 text-white font-medium rounded-full hover:bg-green-700 transition duration-150 shadow-lg shadow-green-200/50">
+                        Download Full Permit Package
+                    </button>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
